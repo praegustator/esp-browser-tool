@@ -20,9 +20,9 @@ export interface PinStats {
   /** Minimum and maximum millivolts seen (analog pins). */
   minMv?: number;
   maxMv?: number;
-  /** Estimated frequency in Hz from the observed transitions. */
+  /** Estimated frequency in Hz from the edges inside the retained trace. */
   frequencyHz?: number;
-  /** Fraction of samples that read high, 0..1. */
+  /** Fraction of retained samples that read high, 0..1. */
   dutyCycle?: number;
 }
 
@@ -49,8 +49,8 @@ export const DEFAULT_TRACE_CAPACITY = 600;
  */
 export class PinStateStore {
   private readonly states = new Map<number, PinRuntimeState>();
-  /** Running high/total digital counters backing the duty-cycle statistic. */
-  private readonly duty = new Map<number, { high: number; total: number }>();
+  /** Running counters over the retained trace, backing the derived statistics. */
+  private readonly windows = new Map<number, { high: number; total: number; edges: number }>();
   private readonly capacity: number;
   private readonly adcMax: number;
 
@@ -120,7 +120,7 @@ export class PinStateStore {
     state.trace.clear();
     state.stats = { transitions: 0 };
     state.last = undefined;
-    this.duty.delete(gpio);
+    this.windows.delete(gpio);
   }
 
   clearAllTraces(): void {
@@ -149,7 +149,7 @@ export class PinStateStore {
     }
     const evicted = state.trace.push(point);
     state.last = point;
-    this.updateStats(state, point, evicted);
+    this.updateStats(state, point, previous, evicted);
     return point;
   }
 
@@ -175,35 +175,45 @@ export class PinStateStore {
   private updateStats(
     state: PinRuntimeState,
     point: TracePoint,
+    previous: TracePoint | undefined,
     evicted: TracePoint | undefined,
   ): void {
     const stats = state.stats;
+    const window = this.window(state.gpio);
+    if (point.d !== undefined) {
+      window.total += 1;
+      window.high += point.d;
+      if (previous?.d !== undefined && previous.d !== point.d) window.edges += 1;
+    }
+    if (evicted?.d !== undefined) {
+      window.total -= 1;
+      window.high -= evicted.d;
+      // The edge between the evicted point and the new oldest one leaves the window too.
+      const oldest = state.trace.at(0);
+      if (oldest?.d !== undefined && oldest.d !== evicted.d) window.edges -= 1;
+    }
+    stats.dutyCycle = window.total > 0 ? window.high / window.total : undefined;
     if (point.mv !== undefined) {
       stats.minMv = stats.minMv === undefined ? point.mv : Math.min(stats.minMv, point.mv);
       stats.maxMv = stats.maxMv === undefined ? point.mv : Math.max(stats.maxMv, point.mv);
     }
     const first = state.trace.at(0);
     const last = state.trace.last();
-    if (first && last && last.t > first.t && stats.transitions > 0) {
+    if (first && last && last.t > first.t && window.edges > 0) {
       const seconds = (last.t - first.t) / 1000;
-      stats.frequencyHz = stats.transitions / 2 / seconds;
+      stats.frequencyHz = window.edges / 2 / seconds;
     } else {
       stats.frequencyHz = undefined;
     }
-    let duty = this.duty.get(state.gpio);
-    if (!duty) {
-      duty = { high: 0, total: 0 };
-      this.duty.set(state.gpio, duty);
+  }
+
+  private window(gpio: number): { high: number; total: number; edges: number } {
+    let window = this.windows.get(gpio);
+    if (!window) {
+      window = { high: 0, total: 0, edges: 0 };
+      this.windows.set(gpio, window);
     }
-    if (point.d !== undefined) {
-      duty.total += 1;
-      duty.high += point.d;
-    }
-    if (evicted?.d !== undefined) {
-      duty.total -= 1;
-      duty.high -= evicted.d;
-    }
-    stats.dutyCycle = duty.total > 0 ? duty.high / duty.total : undefined;
+    return window;
   }
 }
 

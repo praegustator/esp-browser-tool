@@ -79,6 +79,17 @@ describe('PinStateStore duty cycle', () => {
     expect(store.get(2).stats.dutyCycle).toBe(0);
   });
 
+  it('estimates frequency from the edges still inside the window', () => {
+    const store = new PinStateStore({ capacity: 4 });
+    // 20 alternating samples 10 ms apart: only the last four are retained, so the
+    // estimate must stay at 50 Hz instead of growing with the session edge count.
+    for (let index = 0; index < 20; index++) {
+      store.record(2, index * 10, { d: (index % 2) as 0 | 1 });
+    }
+    expect(store.get(2).stats.transitions).toBe(19);
+    expect(store.get(2).stats.frequencyHz).toBeCloseTo(50, 5);
+  });
+
   it('resets the counters when the trace is cleared', () => {
     const store = new PinStateStore({ capacity: 4 });
     store.record(2, 0, { d: 1 });
