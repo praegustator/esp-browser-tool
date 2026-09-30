@@ -36,6 +36,35 @@ each request with exactly one response bearing the same `id`.
 | `watch.clear` | — | Stops streaming. |
 | `scan.i2c` | `sda`, `scl`, `freq?` | Probes addresses 0x01–0x7e. |
 | `scan.pins` | `pins?` | Reads many pins at once. |
+| `sys.baud` | `baud` | Switches the UART speed (see conventions below). |
+| `adc.capture` | `pin`, `rate`, `samples`, `pretrigger?`, `trigger?` | Burst-samples one ADC pin (see below). |
+
+### Burst capture
+
+`adc.capture` records `samples` raw ADC readings (16–4096) from one pin at
+`rate` Hz (100–2 000 000, clamped to what the chip's DMA engine supports; the
+actual limits are advertised in the device info `capture` object). The whole
+capture must fit in 5000 ms. Rates at or above the chip's DMA threshold use the
+ADC continuous (DMA) driver and therefore need an **ADC1** pin; slower rates
+use a paced `analogRead` loop and work on any ADC pin. The device blocks while
+capturing — watch streaming pauses and resumes afterwards.
+
+An optional `trigger` object — `{"edge":"rising"|"falling","mv":0–3600,
+"timeoutMs":1–10000}` — arms an edge trigger: sampling starts only once the
+signal crosses `mv` in the given direction, and `pretrigger` (0–0.9) keeps that
+fraction of the buffer from *before* the trigger point. Without a matching
+edge the command fails with `trigger_timeout`.
+
+The response carries the capture metadata, then the data follows as `capture`
+events:
+
+```jsonc
+{"id":20,"ok":true,"result":{"pin":34,"rate":20000,"samples":1024,"chunks":2,"t0":12345,"triggered":false}}
+{"ev":"capture","pin":34,"seq":0,"chunks":2,"n":512,"t0":12345,"rate":20000,"data":"<base64>"}
+{"ev":"capture","pin":34,"seq":1,"chunks":2,"n":512,"t0":12345,"rate":20000,"data":"<base64>"}
+```
+
+`data` is base64 of `n` little-endian `uint16` raw ADC counts (`0…adcMax`).
 
 ### Pin modes
 
@@ -72,6 +101,9 @@ Error codes used by the firmware:
 | `input_only` | The pin cannot drive a level. |
 | `no_timer` | No free LEDC timer for PWM. |
 | `i2c_failed` | The I²C bus could not be started on the given pins. |
+| `no_adc1` | The requested capture rate needs an ADC1 pin. |
+| `trigger_timeout` | No matching edge arrived before the trigger timeout. |
+| `capture_failed` | The ADC capture driver failed. |
 | `unknown_command` | Unsupported `cmd`. |
 
 ### Events (device → host)
@@ -83,6 +115,7 @@ Events never carry an `id`.
 {"ev":"sample","t":12345,"pins":{"2":{"d":1},"34":{"a":2048,"mv":1650},"4":{"t":42}}}
 {"ev":"log","level":"info","message":"…"}
 {"ev":"pin","pin":2,"value":1,"t":12345}
+{"ev":"capture","pin":34,"seq":0,"chunks":2,"n":512,"t0":12345,"rate":20000,"data":"…"}
 {"ev":"error","error":{"code":"bad_json","message":"…"}}
 ```
 
@@ -103,7 +136,7 @@ the host maps it onto its own clock so traces survive a reboot.
 ```jsonc
 {
   "protocol": 1,
-  "firmware": "esp-browser-tool-diag 1.0.0",
+  "firmware": "esp-browser-tool-diag 1.1.0",
   "chip": "ESP32-D0WD-V3",
   "cores": 2,
   "revision": 3,
@@ -112,18 +145,29 @@ the host maps it onto its own clock so traces survive a reboot.
   "freeHeap": 210000,
   "pins": [0, 2, 4, 5, 12, 13, …],   // GPIOs the firmware will drive
   "maxWatch": 24,
-  "adcMax": 4095
+  "adcMax": 4095,
+  "capture": {"maxSamples": 4096, "minRate": 100, "maxRate": 2000000},
+  "bauds": [115200, 230400, 460800, 921600]
 }
 ```
 
 `pins` excludes everything the firmware refuses to touch: the SPI flash lines,
 the UART0 console pins, and pads that are not bonded out on the package.
+`capture` and `bauds` are optional — firmware 1.0.x omits them and the host
+skips the corresponding features.
 
 ## Conventions
 
-* **Timeouts** — the host rejects a command that is unanswered after 4 s. The
+* **Timeouts** — the host rejects a command that is unanswered after 4 s
+  (longer for `adc.capture`, which answers only after sampling finishes). The
   handshake is retried a few times because a freshly reset board ignores input
   while the bootloader prints its banner.
+* **Baud switching** — the link always opens at 115 200. After the handshake
+  the host may send `sys.baud`; the device acknowledges at the old speed,
+  drains its TX buffer, then switches. The host reopens the port at the new
+  speed (without toggling DTR/RTS, so the board is not reset) and verifies
+  with `sys.info`. Native-USB consoles ignore the rate. Firmware without
+  `sys.baud` answers `unknown_command` and the host simply stays at 115 200.
 * **Ordering** — responses may be interleaved with events, but never with each
   other for the same `id`.
 * **Back pressure** — the firmware only streams what was asked for; lower the

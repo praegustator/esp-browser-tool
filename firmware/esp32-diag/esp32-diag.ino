@@ -20,9 +20,13 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
+#include "mbedtls/base64.h"
+#if SOC_ADC_DMA_SUPPORTED
+#include "esp_adc/adc_continuous.h"
+#endif
 
 #define FIRMWARE_NAME "esp-browser-tool-diag"
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.1.0"
 #define PROTOCOL_VERSION 1
 
 #define SERIAL_BAUD 115200
@@ -30,6 +34,23 @@
 #define MAX_WATCH 24
 #define PWM_RESOLUTION 10
 #define PWM_MAX ((1 << PWM_RESOLUTION) - 1)
+
+// Burst capture limits. Mirror src/protocol/types.ts and docs/PROTOCOL.md.
+#define CAPTURE_MAX_SAMPLES 4096
+#define CAPTURE_CHUNK_SAMPLES 512
+#define CAPTURE_MIN_RATE 100
+#define CAPTURE_MAX_RATE 2000000
+#define CAPTURE_MAX_DURATION_MS 5000
+/** Rates at or above this use the ADC DMA engine; below it, paced analogRead. */
+#if SOC_ADC_DMA_SUPPORTED
+#define CAPTURE_DMA_MIN_RATE SOC_ADC_SAMPLE_FREQ_THRES_LOW
+#define CAPTURE_CHIP_MAX_RATE \
+  (SOC_ADC_SAMPLE_FREQ_THRES_HIGH < CAPTURE_MAX_RATE ? SOC_ADC_SAMPLE_FREQ_THRES_HIGH \
+                                                     : CAPTURE_MAX_RATE)
+#else
+#define CAPTURE_DMA_MIN_RATE 20001
+#define CAPTURE_CHIP_MAX_RATE 20000
+#endif
 
 // ---------------------------------------------------------------- pin model
 
@@ -206,6 +227,17 @@ static void fillInfo(JsonObject info) {
   for (int pin = 0; pin < (int)SOC_GPIO_PIN_COUNT; pin++) {
     if (isValidPin(pin)) available.add(pin);
   }
+
+  JsonObject capture = info["capture"].to<JsonObject>();
+  capture["maxSamples"] = CAPTURE_MAX_SAMPLES;
+  capture["minRate"] = CAPTURE_MIN_RATE;
+  capture["maxRate"] = (uint32_t)CAPTURE_CHIP_MAX_RATE;
+
+  JsonArray bauds = info["bauds"].to<JsonArray>();
+  bauds.add(115200);
+  bauds.add(230400);
+  bauds.add(460800);
+  bauds.add(921600);
 }
 
 static void sendReady() {
@@ -342,6 +374,228 @@ static void emitSamples() {
     samplePin(pin, pinsOut[key].to<JsonObject>());
   }
   sendDocument(doc);
+}
+
+// ------------------------------------------------------------- burst capture
+
+/** One static buffer (8 KB) — capture is strictly one pin at a time. */
+static uint16_t captureBuffer[CAPTURE_MAX_SAMPLES];
+
+struct CaptureTriggerSpec {
+  bool enabled = false;
+  bool rising = true;
+  uint16_t level = 0;        // raw ADC counts
+  uint32_t timeoutMs = 1000;
+};
+
+/**
+ * Feed samples in one at a time; handles the pre-trigger ring buffer, edge
+ * detection and final linearisation so both sampling paths share the logic.
+ * The pre-trigger ring lives in captureBuffer[0..preCount) and is rotated in
+ * place once the trigger fires; sample[preCount] is the triggering sample.
+ */
+struct CaptureEngine {
+  size_t preCount = 0;
+  size_t total = 0;
+  CaptureTriggerSpec trigger;
+
+  size_t ringFill = 0;
+  size_t ringPos = 0;
+  size_t postFill = 0;
+  bool fired = false;
+  bool havePrev = false;
+  uint16_t prev = 0;
+
+  void begin(size_t totalSamples, size_t pretriggerSamples, const CaptureTriggerSpec &spec) {
+    total = totalSamples;
+    trigger = spec;
+    preCount = spec.enabled ? pretriggerSamples : 0;
+    ringFill = 0;
+    ringPos = 0;
+    postFill = 0;
+    fired = !spec.enabled;
+    havePrev = false;
+    prev = 0;
+  }
+
+  bool done() const { return fired && preCount + postFill >= total; }
+
+  void push(uint16_t sample) {
+    if (fired) {
+      if (preCount + postFill < total) captureBuffer[preCount + postFill++] = sample;
+      return;
+    }
+    bool edge = false;
+    if (havePrev && ringFill >= preCount) {
+      edge = trigger.rising ? (prev < trigger.level && sample >= trigger.level)
+                            : (prev > trigger.level && sample <= trigger.level);
+    }
+    prev = sample;
+    havePrev = true;
+    if (edge) {
+      fired = true;
+      unwrapRing();
+      if (preCount + postFill < total) captureBuffer[preCount + postFill++] = sample;
+      return;
+    }
+    if (preCount > 0) {
+      captureBuffer[ringPos] = sample;
+      ringPos = (ringPos + 1) % preCount;
+      if (ringFill < preCount) ringFill++;
+    }
+  }
+
+private:
+  /** Rotate the ring so its oldest sample lands at captureBuffer[0]. */
+  void unwrapRing() {
+    if (preCount == 0) return;
+    size_t start = ringFill < preCount ? 0 : ringPos;
+    reverseRange(0, start);
+    reverseRange(start, preCount);
+    reverseRange(0, preCount);
+  }
+
+  static void reverseRange(size_t from, size_t to) {
+    while (from + 1 < to) {
+      to--;
+      uint16_t swap = captureBuffer[from];
+      captureBuffer[from] = captureBuffer[to];
+      captureBuffer[to] = swap;
+      from++;
+    }
+  }
+};
+
+/** Sample with micros()-paced analogRead; used below the DMA engine's range. */
+static bool captureSlow(int pin, uint32_t rate, CaptureEngine &engine, const char **error) {
+  uint32_t periodUs = 1000000UL / rate;
+  uint32_t triggerDeadline = millis() + engine.trigger.timeoutMs;
+  uint32_t nextUs = micros();
+  while (!engine.done()) {
+    if (!engine.fired && (int32_t)(millis() - triggerDeadline) >= 0) {
+      *error = "trigger_timeout";
+      return false;
+    }
+    while ((int32_t)(micros() - nextUs) < 0) {
+    }
+    nextUs += periodUs;
+    engine.push((uint16_t)analogRead(pin));
+  }
+  return true;
+}
+
+#if SOC_ADC_DMA_SUPPORTED
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#define CAPTURE_OUTPUT_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE1
+#define CAPTURE_FRAME_DATA(p) ((p)->type1.data)
+#define CAPTURE_FRAME_CHANNEL(p) ((p)->type1.channel)
+#else
+#define CAPTURE_OUTPUT_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE2
+#define CAPTURE_FRAME_DATA(p) ((p)->type2.data)
+#define CAPTURE_FRAME_CHANNEL(p) ((p)->type2.channel)
+#endif
+
+/** Sample with the ADC continuous (DMA) driver; ADC1 channels only. */
+static bool captureFast(int pin, uint32_t rate, CaptureEngine &engine, const char **error) {
+  int8_t channel = digitalPinToAnalogChannel(pin);
+  if (channel < 0 || channel >= SOC_ADC1_CHANNEL_NUM) {
+    *error = "no_adc1";
+    return false;
+  }
+
+  adc_continuous_handle_t handle = NULL;
+  adc_continuous_handle_cfg_t handleCfg = {};
+  handleCfg.max_store_buf_size = 4096;
+  handleCfg.conv_frame_size = 256;
+  if (adc_continuous_new_handle(&handleCfg, &handle) != ESP_OK) {
+    *error = "capture_failed";
+    return false;
+  }
+
+  adc_digi_pattern_config_t pattern = {};
+  pattern.atten = ADC_ATTEN_DB_11;
+  pattern.channel = (uint8_t)channel;
+  pattern.unit = ADC_UNIT_1;
+  pattern.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+
+  adc_continuous_config_t digiCfg = {};
+  digiCfg.pattern_num = 1;
+  digiCfg.adc_pattern = &pattern;
+  digiCfg.sample_freq_hz = rate;
+  digiCfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+  digiCfg.format = CAPTURE_OUTPUT_FORMAT;
+  if (adc_continuous_config(handle, &digiCfg) != ESP_OK ||
+      adc_continuous_start(handle) != ESP_OK) {
+    adc_continuous_deinit(handle);
+    *error = "capture_failed";
+    return false;
+  }
+
+  bool ok = true;
+  uint32_t captureMs = (uint32_t)((uint64_t)engine.total * 1000 / rate);
+  uint32_t triggerDeadline = millis() + engine.trigger.timeoutMs;
+  uint32_t hardDeadline = millis() + engine.trigger.timeoutMs + captureMs + 2000;
+  static uint8_t frame[256];
+  while (!engine.done()) {
+    if (!engine.fired && (int32_t)(millis() - triggerDeadline) >= 0) {
+      *error = "trigger_timeout";
+      ok = false;
+      break;
+    }
+    if ((int32_t)(millis() - hardDeadline) >= 0) {
+      *error = "capture_failed";
+      ok = false;
+      break;
+    }
+    uint32_t length = 0;
+    esp_err_t err = adc_continuous_read(handle, frame, sizeof(frame), &length, 20);
+    if (err == ESP_ERR_TIMEOUT) continue;
+    if (err != ESP_OK) {
+      *error = "capture_failed";
+      ok = false;
+      break;
+    }
+    for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= length && !engine.done();
+         i += SOC_ADC_DIGI_RESULT_BYTES) {
+      adc_digi_output_data_t *p = (adc_digi_output_data_t *)&frame[i];
+      if (CAPTURE_FRAME_CHANNEL(p) != (uint32_t)channel) continue;
+      engine.push((uint16_t)CAPTURE_FRAME_DATA(p));
+    }
+  }
+
+  adc_continuous_stop(handle);
+  adc_continuous_deinit(handle);
+  return ok;
+}
+#endif  // SOC_ADC_DMA_SUPPORTED
+
+/** Stream the capture buffer back as base64 chunks of little-endian uint16. */
+static void sendCaptureChunks(int pin, uint32_t rate, size_t samples, uint32_t t0) {
+  size_t chunkCount = (samples + CAPTURE_CHUNK_SAMPLES - 1) / CAPTURE_CHUNK_SAMPLES;
+  static char encoded[((CAPTURE_CHUNK_SAMPLES * 2 + 2) / 3) * 4 + 4];
+  for (size_t seq = 0; seq < chunkCount; seq++) {
+    size_t offset = seq * CAPTURE_CHUNK_SAMPLES;
+    size_t count = samples - offset;
+    if (count > CAPTURE_CHUNK_SAMPLES) count = CAPTURE_CHUNK_SAMPLES;
+    size_t written = 0;
+    // uint16_t is little endian on every ESP32 target, matching the protocol.
+    if (mbedtls_base64_encode((unsigned char *)encoded, sizeof(encoded), &written,
+                              (const unsigned char *)&captureBuffer[offset], count * 2) != 0) {
+      sendLog("error", "capture chunk encode failed");
+      return;
+    }
+    encoded[written] = '\0';
+    JsonDocument doc;
+    doc["ev"] = "capture";
+    doc["pin"] = pin;
+    doc["seq"] = (uint32_t)seq;
+    doc["chunks"] = (uint32_t)chunkCount;
+    doc["n"] = (uint32_t)count;
+    doc["t0"] = t0;
+    doc["rate"] = rate;
+    doc["data"] = encoded;
+    sendDocument(doc);
+  }
 }
 
 // ------------------------------------------------------------- command layer
@@ -638,6 +892,114 @@ static void handleCommand(JsonDocument &doc) {
       }
     }
     sendOk(id, result);
+    return;
+  }
+
+  if (!strcmp(cmd, "sys.baud")) {
+    uint32_t baud = doc["baud"].as<uint32_t>();
+    if (baud != 115200 && baud != 230400 && baud != 460800 && baud != 921600) {
+      sendError(id, "bad_request", "unsupported baud rate");
+      return;
+    }
+    JsonDocument result;
+    result["baud"] = baud;
+    sendOk(id, result);
+#if !ARDUINO_USB_CDC_ON_BOOT
+    // Native USB ports ignore the baud rate; a real UART must switch after
+    // the acknowledgement has fully left at the old speed.
+    Serial.flush();
+    delay(30);
+    Serial.updateBaudRate(baud);
+#endif
+    return;
+  }
+
+  if (!strcmp(cmd, "adc.capture")) {
+    int pin;
+    if (!requirePin(id, doc, pin)) return;
+    if (!hasAdc(pin)) {
+      sendError(id, "bad_mode", "this pin has no ADC channel");
+      return;
+    }
+    uint32_t rate = doc["rate"].as<uint32_t>();
+    uint32_t samples = doc["samples"].as<uint32_t>();
+    if (rate < CAPTURE_MIN_RATE || rate > CAPTURE_MAX_RATE || samples < 16 ||
+        samples > CAPTURE_MAX_SAMPLES) {
+      sendError(id, "bad_request", "rate must be 100..2000000 and samples 16..4096");
+      return;
+    }
+    if (rate > CAPTURE_CHIP_MAX_RATE) rate = CAPTURE_CHIP_MAX_RATE;
+    if ((uint64_t)samples * 1000 / rate > CAPTURE_MAX_DURATION_MS) {
+      sendError(id, "bad_request", "capture longer than 5000 ms");
+      return;
+    }
+
+    float pretrigger = doc["pretrigger"].is<float>() ? doc["pretrigger"].as<float>() : 0.0f;
+    if (pretrigger < 0.0f || pretrigger > 0.9f) {
+      sendError(id, "bad_request", "\"pretrigger\" must be within 0..0.9");
+      return;
+    }
+
+    CaptureTriggerSpec trigger;
+    JsonObject triggerSpec = doc["trigger"].as<JsonObject>();
+    if (!triggerSpec.isNull()) {
+      const char *edge = triggerSpec["edge"];
+      if (!edge || (strcmp(edge, "rising") && strcmp(edge, "falling"))) {
+        sendError(id, "bad_request", "trigger edge must be \"rising\" or \"falling\"");
+        return;
+      }
+      long mv = triggerSpec["mv"].as<long>();
+      if (mv < 0 || mv > 3600) {
+        sendError(id, "bad_request", "trigger \"mv\" must be within 0..3600");
+        return;
+      }
+      trigger.enabled = true;
+      trigger.rising = !strcmp(edge, "rising");
+      long raw = mv * 4095 / 3300;
+      trigger.level = raw > 4095 ? 4095 : (uint16_t)raw;
+      if (triggerSpec["timeoutMs"].is<uint32_t>()) {
+        uint32_t timeoutMs = triggerSpec["timeoutMs"].as<uint32_t>();
+        if (timeoutMs < 1 || timeoutMs > 10000) {
+          sendError(id, "bad_request", "trigger \"timeoutMs\" must be within 1..10000");
+          return;
+        }
+        trigger.timeoutMs = timeoutMs;
+      }
+    }
+
+    CaptureEngine engine;
+    engine.begin(samples, (size_t)(samples * pretrigger), trigger);
+
+    const char *error = "capture_failed";
+    uint32_t t0 = millis();
+    bool ok;
+#if SOC_ADC_DMA_SUPPORTED
+    if (rate >= CAPTURE_DMA_MIN_RATE) {
+      ok = captureFast(pin, rate, engine, &error);
+    } else {
+      ok = captureSlow(pin, rate, engine, &error);
+    }
+#else
+    ok = captureSlow(pin, rate, engine, &error);
+#endif
+    if (!ok) {
+      sendError(id, error,
+                !strcmp(error, "trigger_timeout") ? "no matching edge before the timeout"
+                : !strcmp(error, "no_adc1")       ? "this rate needs an ADC1 pin"
+                                                  : "the ADC capture failed");
+      return;
+    }
+
+    size_t chunkCount = (samples + CAPTURE_CHUNK_SAMPLES - 1) / CAPTURE_CHUNK_SAMPLES;
+    JsonDocument result;
+    result["pin"] = pin;
+    result["rate"] = rate;
+    result["samples"] = samples;
+    result["chunks"] = (uint32_t)chunkCount;
+    result["t0"] = t0;
+    result["triggered"] = trigger.enabled;
+    sendOk(id, result);
+    sendCaptureChunks(pin, rate, samples, t0);
     return;
   }
 
