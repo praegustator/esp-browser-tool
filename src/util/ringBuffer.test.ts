@@ -25,6 +25,15 @@ describe('RingBuffer', () => {
     expect(buffer.last()).toBeUndefined();
   });
 
+  it('returns the evicted entry once full', () => {
+    const buffer = new RingBuffer<number>(2);
+    expect(buffer.push(1)).toBeUndefined();
+    expect(buffer.push(2)).toBeUndefined();
+    expect(buffer.push(3)).toBe(1);
+    expect(buffer.push(4)).toBe(2);
+    expect(buffer.toArray()).toEqual([3, 4]);
+  });
+
   it('rejects invalid capacities', () => {
     expect(() => new RingBuffer<number>(0)).toThrow(RangeError);
     expect(() => new RingBuffer<number>(1.5)).toThrow(RangeError);

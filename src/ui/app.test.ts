@@ -118,6 +118,10 @@ describe('App shell', () => {
     await waitFor(() => app.controller.store.get(2).blink === 500, 3000);
     expect(app.controller.store.get(2).mode).toBe('output');
     expect(app.controller.store.watchedPins()).toContain(2);
+    await waitFor(
+      () => tileOf(app, 2).querySelector<HTMLInputElement>('input[type="range"]')?.value === '500',
+      3000,
+    );
   });
 
   it('releases every pin on request', async () => {

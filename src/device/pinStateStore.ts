@@ -49,6 +49,8 @@ export const DEFAULT_TRACE_CAPACITY = 600;
  */
 export class PinStateStore {
   private readonly states = new Map<number, PinRuntimeState>();
+  /** Running high/total digital counters backing the duty-cycle statistic. */
+  private readonly duty = new Map<number, { high: number; total: number }>();
   private readonly capacity: number;
   private readonly adcMax: number;
 
@@ -118,14 +120,11 @@ export class PinStateStore {
     state.trace.clear();
     state.stats = { transitions: 0 };
     state.last = undefined;
+    this.duty.delete(gpio);
   }
 
   clearAllTraces(): void {
-    for (const state of this.states.values()) {
-      state.trace.clear();
-      state.stats = { transitions: 0 };
-      state.last = undefined;
-    }
+    for (const gpio of this.states.keys()) this.clearTrace(gpio);
   }
 
   /** Ingest one `sample` event; returns the GPIOs it touched. */
@@ -148,9 +147,9 @@ export class PinStateStore {
     if (previous?.d !== undefined && point.d !== undefined && previous.d !== point.d) {
       state.stats.transitions += 1;
     }
-    state.trace.push(point);
+    const evicted = state.trace.push(point);
     state.last = point;
-    this.updateStats(state, point);
+    this.updateStats(state, point, evicted);
     return point;
   }
 
@@ -173,7 +172,11 @@ export class PinStateStore {
     return point;
   }
 
-  private updateStats(state: PinRuntimeState, point: TracePoint): void {
+  private updateStats(
+    state: PinRuntimeState,
+    point: TracePoint,
+    evicted: TracePoint | undefined,
+  ): void {
     const stats = state.stats;
     if (point.mv !== undefined) {
       stats.minMv = stats.minMv === undefined ? point.mv : Math.min(stats.minMv, point.mv);
@@ -187,14 +190,20 @@ export class PinStateStore {
     } else {
       stats.frequencyHz = undefined;
     }
-    let high = 0;
-    let total = 0;
-    for (const item of state.trace) {
-      if (item.d === undefined) continue;
-      total += 1;
-      high += item.d;
+    let duty = this.duty.get(state.gpio);
+    if (!duty) {
+      duty = { high: 0, total: 0 };
+      this.duty.set(state.gpio, duty);
     }
-    stats.dutyCycle = total > 0 ? high / total : undefined;
+    if (point.d !== undefined) {
+      duty.total += 1;
+      duty.high += point.d;
+    }
+    if (evicted?.d !== undefined) {
+      duty.total -= 1;
+      duty.high -= evicted.d;
+    }
+    stats.dutyCycle = duty.total > 0 ? duty.high / duty.total : undefined;
   }
 }
 

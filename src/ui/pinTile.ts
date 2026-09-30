@@ -35,6 +35,8 @@ export class PinTile {
   private readonly canvas: HTMLCanvasElement;
   private readonly watchToggle: HTMLInputElement;
   private renderedMode: PinMode | null = null;
+  /** Live controls of the current mode, kept so `update()` can resync them. */
+  private syncControls: (() => void) | null = null;
 
   constructor(controller: DiagnosticsController, definition: PinDefinition) {
     this.controller = controller;
@@ -134,6 +136,8 @@ export class PinTile {
     if (this.renderedMode !== state.mode) {
       this.renderedMode = state.mode;
       this.renderControls(state);
+    } else {
+      this.syncControls?.();
     }
     this.renderStats(state);
     this.renderScope(state);
@@ -141,6 +145,7 @@ export class PinTile {
 
   private renderControls(state: PinRuntimeState): void {
     clear(this.controlsNode);
+    this.syncControls = null;
     const gpio = this.definition.gpio;
     const controller = this.controller;
     switch (state.mode) {
@@ -180,6 +185,12 @@ export class PinTile {
           el('div', { class: 'btn-row' }, high, low, toggle, pulse),
           el('label', { class: 'slider-row' }, el('span', { text: 'Blink' }), blink, blinkLabel),
         );
+        this.syncControls = () => {
+          if (document.activeElement === blink) return;
+          const period = this.state().blink ?? 0;
+          blink.value = String(period);
+          blinkLabel.textContent = blinkText(period);
+        };
         return;
       }
       case 'pwm': {
@@ -217,6 +228,15 @@ export class PinTile {
           el('label', { class: 'slider-row' }, el('span', { text: 'Duty' }), duty, dutyLabel),
           el('label', { class: 'slider-row' }, el('span', { text: 'Hz' }), freq),
         );
+        this.syncControls = () => {
+          const pwm = this.state().pwm;
+          if (!pwm) return;
+          if (document.activeElement !== duty) {
+            duty.value = String(Math.round(pwm.duty * 100));
+            dutyLabel.textContent = `${duty.value} %`;
+          }
+          if (document.activeElement !== freq) freq.value = String(pwm.freq);
+        };
         return;
       }
       case 'analog':

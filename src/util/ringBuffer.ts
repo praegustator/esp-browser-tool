@@ -15,10 +15,13 @@ export class RingBuffer<T> {
     return this.size_;
   }
 
-  push(item: T): void {
+  /** Appends `item`, returning the entry it evicted once the buffer is full. */
+  push(item: T): T | undefined {
+    const evicted = this.size_ === this.capacity ? (this.items[this.head] as T) : undefined;
     this.items[this.head] = item;
     this.head = (this.head + 1) % this.capacity;
     if (this.size_ < this.capacity) this.size_ += 1;
+    return evicted;
   }
 
   /** Oldest-first iteration. */

@@ -70,6 +70,25 @@ describe('PinStateStore', () => {
   });
 });
 
+describe('PinStateStore duty cycle', () => {
+  it('only counts samples still inside the trace window', () => {
+    const store = new PinStateStore({ capacity: 4 });
+    for (let index = 0; index < 4; index++) store.record(2, index * 10, { d: 1 });
+    expect(store.get(2).stats.dutyCycle).toBe(1);
+    for (let index = 4; index < 8; index++) store.record(2, index * 10, { d: 0 });
+    expect(store.get(2).stats.dutyCycle).toBe(0);
+  });
+
+  it('resets the counters when the trace is cleared', () => {
+    const store = new PinStateStore({ capacity: 4 });
+    store.record(2, 0, { d: 1 });
+    store.clearTrace(2);
+    expect(store.get(2).stats.dutyCycle).toBeUndefined();
+    store.record(2, 10, { d: 0 });
+    expect(store.get(2).stats.dutyCycle).toBe(0);
+  });
+});
+
 describe('formatValue', () => {
   it('formats according to the pin mode', () => {
     const store = new PinStateStore();

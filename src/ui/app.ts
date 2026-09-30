@@ -37,7 +37,6 @@ export class App {
   private readonly connectButton: HTMLButtonElement;
   private readonly demoButton: HTMLButtonElement;
   private readonly actionsNode: HTMLElement;
-  private simulator: SimulatedBoard | null = null;
   private frameRequested = false;
   private dirtyPins = new Set<number>();
 
@@ -185,8 +184,7 @@ export class App {
 
   private async connectSimulated(): Promise<void> {
     try {
-      this.simulator = new SimulatedBoard();
-      await this.controller.connect(this.simulator);
+      await this.controller.connect(new SimulatedBoard());
       this.controller.log(
         'info',
         'Demo board connected — no hardware involved. Values are synthesised.',
@@ -199,7 +197,6 @@ export class App {
   private async disconnect(): Promise<void> {
     try {
       await this.controller.disconnect();
-      this.simulator = null;
     } catch (error) {
       this.reportError(error);
     }

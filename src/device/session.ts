@@ -163,7 +163,7 @@ export class DeviceSession {
 
   // --------------------------------------------------------------- commands
 
-  info$(): Promise<DeviceInfo> {
+  sysInfo(): Promise<DeviceInfo> {
     return this.call<DeviceInfo>({ cmd: 'sys.info' });
   }
 
