@@ -106,7 +106,11 @@ export class FlashPanel {
 
   private async flashFromManifest(): Promise<void> {
     await this.flash(async (chip) => {
-      const manifest = await loadManifest(this.manifestUrl);
+      const manifest = await loadManifest(this.manifestUrl).catch((error: unknown) => {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}. This deployment ships no prebuilt binaries — build the firmware (see firmware/README.md) and use "Flash locally built binaries" below.`,
+        );
+      });
       this.controller.log('info', `Manifest: ${manifest.name} ${manifest.version}`);
       return downloadBuild(manifest, this.manifestUrl, chip, fetch, location.href);
     });
