@@ -35,6 +35,16 @@ export interface SessionOptions {
 
 export type SessionStatus = 'closed' | 'connecting' | 'connected';
 
+/** Metadata the firmware returns for an accepted `adc.capture`. */
+export interface CaptureMeta {
+  pin: number;
+  rate: number;
+  samples: number;
+  chunks: number;
+  t0: number;
+  triggered?: boolean;
+}
+
 /**
  * Turns a byte-level {@link Transport} into a typed, promise based device API.
  *
@@ -139,14 +149,15 @@ export class DeviceSession {
   }
 
   /** Send a command and await its response. */
-  call<T = unknown>(request: RequestBody): Promise<T> {
+  call<T = unknown>(request: RequestBody, options: { timeout?: number } = {}): Promise<T> {
+    const timeoutMs = options.timeout ?? this.timeout;
     const id = this.nextId++;
     const full = { ...request, id } as Request;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new DeviceError('timeout', `command "${full.cmd}" timed out after ${this.timeout} ms`));
-      }, this.timeout);
+        reject(new DeviceError('timeout', `command "${full.cmd}" timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
       this.pending.set(id, {
         resolve: resolve as (value: unknown) => void,
         reject,
@@ -207,6 +218,22 @@ export class DeviceSession {
 
   scanI2c(sda: number, scl: number): Promise<{ devices: number[] }> {
     return this.call({ cmd: 'scan.i2c', sda, scl });
+  }
+
+  /** Ask the firmware to switch the link speed (it answers at the old speed). */
+  setBaud(baud: number): Promise<{ baud: number }> {
+    return this.call({ cmd: 'sys.baud', baud });
+  }
+
+  /**
+   * Start a burst capture. The response only carries the metadata; the sample
+   * chunks follow as `capture` events (see {@link onEvent}).
+   */
+  captureAdc(
+    body: RequestBody<Extract<Request, { cmd: 'adc.capture' }>>,
+    options: { timeout?: number } = {},
+  ): Promise<CaptureMeta> {
+    return this.call<CaptureMeta>(body, options);
   }
 
   reboot(): Promise<unknown> {

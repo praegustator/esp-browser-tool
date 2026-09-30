@@ -1,12 +1,18 @@
 import {
+  CAPTURE_CHUNK_SAMPLES,
+  CAPTURE_MAX_RATE,
+  CAPTURE_MAX_SAMPLES,
+  CAPTURE_MIN_RATE,
   DEFAULT_BAUD_RATE,
   PROTOCOL_VERSION,
+  SUPPORTED_BAUD_RATES,
   type DeviceInfo,
   type PinMode,
   type PinSample,
   type Request,
 } from '../protocol/types';
 import { validateRequest } from '../protocol/codec';
+import { encodeBase64 } from '../util/base64';
 import { Emitter, type Transport } from './types';
 
 /** Deterministic xorshift so simulated noise is reproducible in tests. */
@@ -80,6 +86,7 @@ export class SimulatedBoard implements Transport {
   private watchPins: number[] = [];
   private watchHandle: unknown = null;
   private open_ = false;
+  private baudRate_ = DEFAULT_BAUD_RATE;
 
   constructor(options: SimulatorOptions = {}) {
     this.chip = options.chip ?? 'ESP32-D0WD-V3 (simulated)';
@@ -113,7 +120,12 @@ export class SimulatedBoard implements Transport {
   }
 
   get baudRate(): number {
-    return DEFAULT_BAUD_RATE;
+    return this.baudRate_;
+  }
+
+  /** The simulated link changes speed instantly. */
+  async setBaudRate(baud: number): Promise<void> {
+    this.baudRate_ = baud;
   }
 
   async open(): Promise<void> {
@@ -192,6 +204,15 @@ export class SimulatedBoard implements Transport {
       case 'hello':
       case 'sys.info':
         this.respond(request.id, this.info());
+        return;
+      case 'sys.baud':
+        // validateRequest already checked the value; switch after replying,
+        // mirroring the firmware which flushes the OK at the old speed first.
+        this.respond(request.id, { baud: request.baud });
+        this.baudRate_ = request.baud;
+        return;
+      case 'adc.capture':
+        this.handleCapture(request);
         return;
       case 'sys.reset':
         this.resetAll();
@@ -322,6 +343,73 @@ export class SimulatedBoard implements Transport {
     }
   }
 
+  /**
+   * Synthesise a burst capture: a clean sine with a little noise, spanning a
+   * few dozen cycles, phase-aligned to the trigger when one was requested.
+   */
+  private handleCapture(request: Extract<Request, { cmd: 'adc.capture' }>): void {
+    if (!this.pins.has(request.pin)) {
+      this.respondError(request.id, 'bad_pin', `GPIO${request.pin} is not available on this board`);
+      return;
+    }
+    if (!this.adcPins.has(request.pin)) {
+      this.respondError(request.id, 'no_adc', `GPIO${request.pin} has no ADC channel`);
+      return;
+    }
+    const { rate, samples } = request;
+    const mid = 2048;
+    const amplitude = 1843; // ±1.48 V around mid-scale
+    const period = 64; // samples per cycle → rate/64 Hz signal
+    const preCount = Math.floor((request.pretrigger ?? 0.25) * samples);
+    let phase = 0;
+    let triggered = false;
+    if (request.trigger) {
+      const offset = (request.trigger.mv / 3300) * 4095 - mid;
+      if (Math.abs(offset) > amplitude) {
+        this.respondError(request.id, 'trigger_timeout', 'the signal never crossed the trigger level');
+        return;
+      }
+      const crossing = Math.asin(offset / amplitude);
+      phase = (request.trigger.edge === 'rising' ? crossing : Math.PI - crossing) -
+        (2 * Math.PI * preCount) / period;
+      triggered = true;
+    }
+    const data = new Uint16Array(samples);
+    for (let index = 0; index < samples; index++) {
+      const value = mid + amplitude * Math.sin((2 * Math.PI * index) / period + phase);
+      const noisy = value + (this.random() - 0.5) * 16;
+      data[index] = Math.max(0, Math.min(4095, Math.round(noisy)));
+    }
+    const chunks = Math.ceil(samples / CAPTURE_CHUNK_SAMPLES);
+    const t0 = this.uptime();
+    this.respond(request.id, {
+      pin: request.pin,
+      rate,
+      samples,
+      chunks,
+      t0,
+      triggered,
+    });
+    for (let seq = 0; seq < chunks; seq++) {
+      const slice = data.subarray(seq * CAPTURE_CHUNK_SAMPLES, (seq + 1) * CAPTURE_CHUNK_SAMPLES);
+      const bytes = new Uint8Array(slice.length * 2);
+      for (let index = 0; index < slice.length; index++) {
+        bytes[index * 2] = slice[index]! & 0xff;
+        bytes[index * 2 + 1] = slice[index]! >> 8;
+      }
+      this.emit({
+        ev: 'capture',
+        pin: request.pin,
+        seq,
+        chunks,
+        n: slice.length,
+        t0,
+        rate,
+        data: encodeBase64(bytes),
+      });
+    }
+  }
+
   private resetAll(): void {
     for (const state of this.pins.values()) {
       state.mode = 'disabled';
@@ -437,6 +525,12 @@ export class SimulatedBoard implements Transport {
       pins: this.pinList,
       maxWatch: 16,
       adcMax: 4095,
+      capture: {
+        maxSamples: CAPTURE_MAX_SAMPLES,
+        minRate: CAPTURE_MIN_RATE,
+        maxRate: CAPTURE_MAX_RATE,
+      },
+      bauds: [...SUPPORTED_BAUD_RATES],
     };
   }
 

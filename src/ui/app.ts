@@ -10,6 +10,8 @@ import { button, clear, el, select } from './dom';
 import { FlashPanel } from './flashPanel';
 import { LogView } from './logView';
 import { PinTile } from './pinTile';
+import { ScopePanel } from './scopePanel';
+import type { PinDefinition } from '../device/boards';
 
 export interface AppOptions {
   manifestUrl?: string;
@@ -17,7 +19,13 @@ export interface AppOptions {
   autoDemo?: boolean;
 }
 
-const INTERVALS = [10, 20, 50, 100, 250, 500] as const;
+const INTERVALS = [5, 10, 20, 50, 100, 250, 500] as const;
+
+/** Highest waveform frequency a given sampling interval can show faithfully. */
+function nyquistText(intervalMs: number): string {
+  const nyquistHz = 1000 / intervalMs / 2;
+  return `≤ ${nyquistHz >= 10 ? Math.round(nyquistHz) : nyquistHz.toFixed(1)} Hz waves`;
+}
 
 /**
  * Top level view: toolbar, flashing panel, pin matrix and console.
@@ -39,6 +47,7 @@ export class App {
   private readonly actionsNode: HTMLElement;
   private frameRequested = false;
   private dirtyPins = new Set<number>();
+  private scopePanel: ScopePanel | null = null;
 
   constructor(options: AppOptions = {}) {
     this.controller = new DiagnosticsController();
@@ -120,10 +129,18 @@ export class App {
     );
     boardSelect.setAttribute('aria-label', 'Board layout');
 
+    const bandwidthNote = el('span', {
+      class: 'bandwidth-note muted',
+      text: nyquistText(this.controller.watchInterval),
+      title: 'Signals faster than this alias on the live trace — use a burst capture instead.',
+    });
     const intervalSelect = select<string>(
       INTERVALS.map(String),
       String(this.controller.watchInterval),
-      (value) => this.controller.setWatchInterval(Number(value)),
+      (value) => {
+        bandwidthNote.textContent = nyquistText(Number(value));
+        return this.controller.setWatchInterval(Number(value));
+      },
       (value) => `${value} ms`,
     );
     intervalSelect.setAttribute('aria-label', 'Sampling interval');
@@ -149,6 +166,7 @@ export class App {
         { class: 'toolbar-group' },
         el('label', { class: 'field' }, el('span', { text: 'Layout' }), boardSelect),
         el('label', { class: 'field' }, el('span', { text: 'Sample every' }), intervalSelect),
+        bandwidthNote,
       ),
       el('div', { class: 'toolbar-group toolbar-status' }, this.statusNode, this.infoNode),
     );
@@ -267,14 +285,31 @@ export class App {
   }
 
   private renderGrid(): void {
+    this.closeScope();
     clear(this.grid);
     this.tiles.clear();
     for (const definition of this.controller.visiblePins()) {
-      const tile = new PinTile(this.controller, definition);
+      const tile = new PinTile(this.controller, definition, {
+        onExpand: () => this.openScope(definition),
+      });
       this.tiles.set(definition.gpio, tile);
       this.grid.appendChild(tile.root);
       tile.update();
     }
+  }
+
+  /** Open the expanded oscilloscope view for one pin (one panel at a time). */
+  private openScope(definition: PinDefinition): void {
+    this.closeScope();
+    this.scopePanel = new ScopePanel(this.controller, definition, () => {
+      this.scopePanel = null;
+    });
+    this.root.appendChild(this.scopePanel.root);
+  }
+
+  private closeScope(): void {
+    this.scopePanel?.destroy();
+    this.scopePanel = null;
   }
 
   /** Coalesce updates into one animation frame to keep fast streams smooth. */

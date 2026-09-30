@@ -41,6 +41,7 @@ export type CommandName =
   | 'hello'
   | 'sys.info'
   | 'sys.reset'
+  | 'sys.baud'
   | 'pin.mode'
   | 'pin.read'
   | 'pin.write'
@@ -51,6 +52,7 @@ export type CommandName =
   | 'pin.reset'
   | 'watch.set'
   | 'watch.clear'
+  | 'adc.capture'
   | 'scan.i2c'
   | 'scan.pins';
 
@@ -72,6 +74,12 @@ export interface SysInfoRequest extends RequestBase {
 
 export interface SysResetRequest extends RequestBase {
   cmd: 'sys.reset';
+}
+
+export interface SysBaudRequest extends RequestBase {
+  cmd: 'sys.baud';
+  /** New link speed; must be one of {@link SUPPORTED_BAUD_RATES}. */
+  baud: number;
 }
 
 export interface PinModeRequest extends RequestBase {
@@ -138,6 +146,27 @@ export interface WatchClearRequest extends RequestBase {
   cmd: 'watch.clear';
 }
 
+/** Edge trigger for a burst capture. */
+export interface CaptureTrigger {
+  edge: 'rising' | 'falling';
+  /** Trigger level in millivolts. */
+  mv: number;
+  /** Give up waiting for the edge after this long (ms). */
+  timeoutMs?: number;
+}
+
+export interface AdcCaptureRequest extends RequestBase {
+  cmd: 'adc.capture';
+  pin: number;
+  /** Sampling rate in Hz. */
+  rate: number;
+  /** Number of samples to record. */
+  samples: number;
+  /** Fraction (0..0.9) of samples kept from before the trigger instant. */
+  pretrigger?: number;
+  trigger?: CaptureTrigger;
+}
+
 export interface ScanI2cRequest extends RequestBase {
   cmd: 'scan.i2c';
   sda: number;
@@ -156,6 +185,7 @@ export type Request =
   | HelloRequest
   | SysInfoRequest
   | SysResetRequest
+  | SysBaudRequest
   | PinModeRequest
   | PinReadRequest
   | PinWriteRequest
@@ -166,6 +196,7 @@ export type Request =
   | PinResetRequest
   | WatchSetRequest
   | WatchClearRequest
+  | AdcCaptureRequest
   | ScanI2cRequest
   | ScanPinsRequest;
 
@@ -198,6 +229,14 @@ export interface DeviceInfo {
   maxWatch?: number;
   /** ADC full-scale reading, e.g. 4095. */
   adcMax?: number;
+  /** Burst capture limits, present when the firmware supports `adc.capture`. */
+  capture?: {
+    maxSamples: number;
+    minRate: number;
+    maxRate: number;
+  };
+  /** Link speeds the firmware accepts for `sys.baud`. */
+  bauds?: number[];
 }
 
 export interface ProtocolError {
@@ -219,7 +258,7 @@ export interface ErrResponse {
 
 export type Response<T = unknown> = OkResponse<T> | ErrResponse;
 
-export type EventName = 'ready' | 'sample' | 'log' | 'pin' | 'error';
+export type EventName = 'ready' | 'sample' | 'log' | 'pin' | 'capture' | 'error';
 
 export interface ReadyEvent {
   ev: 'ready';
@@ -248,12 +287,35 @@ export interface PinEvent {
   t: number;
 }
 
+/** One chunk of a burst capture; `data` is base64 of little-endian uint16 raw ADC counts. */
+export interface CaptureChunkEvent {
+  ev: 'capture';
+  pin: number;
+  /** 0-based chunk index. */
+  seq: number;
+  /** Total number of chunks in this capture. */
+  chunks: number;
+  /** Samples in this chunk. */
+  n: number;
+  /** Device uptime (ms) of the first retained sample. */
+  t0: number;
+  /** Actual sampling rate in Hz. */
+  rate: number;
+  data: string;
+}
+
 export interface ErrorEvent {
   ev: 'error';
   error: ProtocolError;
 }
 
-export type DeviceEvent = ReadyEvent | SampleEvent | LogEvent | PinEvent | ErrorEvent;
+export type DeviceEvent =
+  | ReadyEvent
+  | SampleEvent
+  | LogEvent
+  | PinEvent
+  | CaptureChunkEvent
+  | ErrorEvent;
 
 export type DeviceMessage = Response | DeviceEvent;
 
@@ -269,3 +331,18 @@ export const PROTOCOL_VERSION = 1;
 
 /** Default serial speed used by the firmware and the flasher. */
 export const DEFAULT_BAUD_RATE = 115200;
+
+/** Link speeds `sys.baud` may switch to. */
+export const SUPPORTED_BAUD_RATES = [115200, 230400, 460800, 921600] as const;
+
+/** Speed the host tries to upgrade the link to after the handshake. */
+export const PREFERRED_BAUD_RATE = 921600;
+
+/** Burst capture bounds shared by host validation and the simulator. */
+export const CAPTURE_MAX_SAMPLES = 4096;
+export const CAPTURE_MIN_RATE = 100;
+export const CAPTURE_MAX_RATE = 2_000_000;
+/** A capture (samples / rate) may not span more than this many milliseconds. */
+export const CAPTURE_MAX_DURATION_MS = 5000;
+/** Samples per `capture` chunk event. */
+export const CAPTURE_CHUNK_SAMPLES = 512;

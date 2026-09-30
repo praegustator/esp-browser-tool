@@ -464,3 +464,96 @@ input[type='file'] {
 .help-list li {
   margin-bottom: 6px;
 }
+
+/* --------------------------------------------------------- scope panel */
+
+.scope-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(2, 6, 14, 0.7);
+  backdrop-filter: blur(2px);
+}
+
+.scope-panel {
+  width: min(780px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+
+.scope-panel .panel-head {
+  justify-content: space-between;
+}
+
+.scope-close {
+  font-size: 14px;
+  padding: 4px 10px;
+}
+
+.scope-canvas {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  display: block;
+  cursor: crosshair;
+}
+
+.pin-scope-clickable {
+  cursor: zoom-in;
+}
+
+.scope-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.scope-readouts {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text);
+  min-height: 18px;
+}
+
+.scope-cursors {
+  margin: 4px 0 0;
+  min-height: 16px;
+}
+
+.capture-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.capture-title {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.capture-row .number {
+  width: 76px;
+}
+
+.capture-status {
+  margin: 0;
+  font-size: 12px;
+}
+
+.bandwidth-note {
+  margin: 0;
+  font-size: 12px;
+  white-space: nowrap;
+}

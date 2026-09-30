@@ -40,7 +40,11 @@ export class PinTile {
   /** Live controls of the current mode, kept so `update()` can resync them. */
   private syncControls: (() => void) | null = null;
 
-  constructor(controller: DiagnosticsController, definition: PinDefinition) {
+  constructor(
+    controller: DiagnosticsController,
+    definition: PinDefinition,
+    options: { onExpand?: () => void } = {},
+  ) {
     this.controller = controller;
     this.definition = definition;
 
@@ -48,6 +52,12 @@ export class PinTile {
     this.statsNode = el('div', { class: 'pin-stats' });
     this.controlsNode = el('div', { class: 'pin-controls' });
     this.canvas = el('canvas', { class: 'pin-scope' });
+    if (options.onExpand) {
+      const expand = options.onExpand;
+      this.canvas.classList.add('pin-scope-clickable');
+      this.canvas.title = 'Open the full scope view';
+      this.canvas.addEventListener('click', () => expand());
+    }
     this.watchToggle = el('input', {
       attrs: { type: 'checkbox', 'aria-label': `Watch GPIO${definition.gpio}` },
       on: {
@@ -95,6 +105,9 @@ export class PinTile {
         'footer',
         { class: 'pin-foot' },
         el('span', { class: 'pin-caps', text: this.capabilityText() }),
+        options.onExpand
+          ? button('Scope', options.onExpand, { class: 'btn-ghost' })
+          : null,
         button('Read', () => this.run(() => controller.readOnce(definition.gpio)), {
           class: 'btn-ghost',
         }),
@@ -271,6 +284,10 @@ export class PinTile {
     if (stats.transitions > 0) parts.push(`${stats.transitions} edges`);
     if (stats.frequencyHz !== undefined && Number.isFinite(stats.frequencyHz)) {
       parts.push(`${stats.frequencyHz.toFixed(1)} Hz`);
+      // Edge counting aliases for anything near or past the Nyquist rate of
+      // the watch interval; be honest instead of showing a confident number.
+      const nyquistHz = 1000 / this.controller.watchInterval / 2;
+      if (stats.frequencyHz >= nyquistHz * 0.7) parts.push('⚠ near sampling limit, may alias');
     }
     if (stats.dutyCycle !== undefined) parts.push(`${Math.round(stats.dutyCycle * 100)} % high`);
     if (stats.minMv !== undefined && stats.maxMv !== undefined && state.mode === 'analog') {

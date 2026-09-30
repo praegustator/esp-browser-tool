@@ -60,7 +60,7 @@ export class SerialTransport implements Transport {
   readonly name: string;
 
   private readonly port: SerialPort;
-  private readonly baudRate: number;
+  private baudRate_: number;
   private readonly resetOnOpen: boolean;
   private readonly framer = new LineFramer();
   private readonly lineEmitter = new Emitter<string>();
@@ -76,7 +76,7 @@ export class SerialTransport implements Transport {
 
   constructor(port: SerialPort, options: SerialTransportOptions = {}) {
     this.port = port;
-    this.baudRate = options.baudRate ?? DEFAULT_BAUD_RATE;
+    this.baudRate_ = options.baudRate ?? DEFAULT_BAUD_RATE;
     this.resetOnOpen = options.resetOnOpen ?? true;
     this.name = describePort(port);
   }
@@ -85,9 +85,13 @@ export class SerialTransport implements Transport {
     return this.open_;
   }
 
+  get baudRate(): number {
+    return this.baudRate_;
+  }
+
   async open(): Promise<void> {
     if (this.open_) return;
-    await this.port.open({ baudRate: this.baudRate, bufferSize: 4096 });
+    await this.port.open({ baudRate: this.baudRate_, bufferSize: 4096 });
     this.open_ = true;
     this.closing = false;
     this.framer.reset();
@@ -143,6 +147,45 @@ export class SerialTransport implements Transport {
       await delay(120);
     } catch {
       // Adapters without modem control lines simply cannot be reset this way.
+    }
+  }
+
+  /**
+   * Close and reopen the port at a new speed without pulsing the reset lines.
+   * Web Serial cannot change the baud rate of an open port, so this briefly
+   * tears the streams down; the caller must make sure the device is quiet.
+   */
+  async setBaudRate(baud: number): Promise<void> {
+    if (!this.open_) throw new Error('Serial port is not open');
+    if (baud === this.baudRate_) return;
+    this.closing = true;
+    try {
+      await this.writeChain.catch(() => undefined);
+      await this.reader?.cancel().catch(() => undefined);
+      this.reader?.releaseLock();
+      await this.writer?.close().catch(() => undefined);
+      this.writer?.releaseLock();
+      await this.readLoop?.catch(() => undefined);
+      await this.port.close();
+      await this.port.open({ baudRate: baud, bufferSize: 4096 });
+      if (!this.port.readable || !this.port.writable) {
+        throw new Error('Serial port reopened without readable/writable streams');
+      }
+      this.baudRate_ = baud;
+      this.framer.reset();
+      this.writeChain = Promise.resolve();
+      this.reader = this.port.readable.getReader();
+      this.writer = this.port.writable.getWriter();
+      this.closing = false;
+      this.readLoop = this.pump();
+    } catch (error) {
+      this.open_ = false;
+      this.reader = null;
+      this.writer = null;
+      this.readLoop = null;
+      this.closing = false;
+      this.closeEmitter.emit(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     }
   }
 

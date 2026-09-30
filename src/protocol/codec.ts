@@ -1,5 +1,11 @@
 import {
+  CAPTURE_MAX_DURATION_MS,
+  CAPTURE_MAX_RATE,
+  CAPTURE_MAX_SAMPLES,
+  CAPTURE_MIN_RATE,
+  SUPPORTED_BAUD_RATES,
   type DeviceEvent,
+  type DeviceInfo,
   type DeviceMessage,
   type PinSample,
   type Request,
@@ -44,6 +50,15 @@ function parseSample(value: unknown): PinSample {
   return sample;
 }
 
+function parseCaptureInfo(value: unknown): DeviceInfo['capture'] | undefined {
+  if (!isRecord(value)) return undefined;
+  const maxSamples = asFiniteNumber(value.maxSamples);
+  const minRate = asFiniteNumber(value.minRate);
+  const maxRate = asFiniteNumber(value.maxRate);
+  if (maxSamples === undefined || minRate === undefined || maxRate === undefined) return undefined;
+  return { maxSamples, minRate, maxRate };
+}
+
 function parseEvent(raw: Record<string, unknown>, line: string): DeviceEvent {
   switch (raw.ev) {
     case 'ready': {
@@ -73,6 +88,12 @@ function parseEvent(raw: Record<string, unknown>, line: string): DeviceEvent {
             : {}),
           ...(asFiniteNumber(info.adcMax) !== undefined
             ? { adcMax: asFiniteNumber(info.adcMax) }
+            : {}),
+          ...(parseCaptureInfo(info.capture) !== undefined
+            ? { capture: parseCaptureInfo(info.capture) }
+            : {}),
+          ...(Array.isArray(info.bauds)
+            ? { bauds: info.bauds.filter((b): b is number => asFiniteNumber(b) !== undefined) }
             : {}),
         },
       };
@@ -104,6 +125,33 @@ function parseEvent(raw: Record<string, unknown>, line: string): DeviceEvent {
         throw new ProtocolParseError('malformed pin event', line);
       }
       return { ev: 'pin', pin, value: raw.value, t: asFiniteNumber(raw.t) ?? 0 };
+    }
+    case 'capture': {
+      const pin = asFiniteNumber(raw.pin);
+      const seq = asFiniteNumber(raw.seq);
+      const chunks = asFiniteNumber(raw.chunks);
+      const n = asFiniteNumber(raw.n);
+      const rate = asFiniteNumber(raw.rate);
+      if (
+        pin === undefined ||
+        seq === undefined ||
+        chunks === undefined ||
+        n === undefined ||
+        rate === undefined ||
+        typeof raw.data !== 'string'
+      ) {
+        throw new ProtocolParseError('malformed capture event', line);
+      }
+      return {
+        ev: 'capture',
+        pin,
+        seq,
+        chunks,
+        n,
+        t0: asFiniteNumber(raw.t0) ?? 0,
+        rate,
+        data: raw.data,
+      };
     }
     case 'error': {
       const error = isRecord(raw.error) ? raw.error : {};
@@ -209,6 +257,51 @@ export function validateRequest(request: Request): string | null {
       return request.interval >= 5 && request.interval <= 10_000
         ? null
         : 'interval must be within 5..10000';
+    }
+    case 'sys.baud':
+      return (SUPPORTED_BAUD_RATES as readonly number[]).includes(request.baud)
+        ? null
+        : `baud must be one of ${SUPPORTED_BAUD_RATES.join(', ')}`;
+    case 'adc.capture': {
+      const pinProblem = validPin(request.pin);
+      if (pinProblem) return pinProblem;
+      if (
+        !Number.isFinite(request.rate) ||
+        request.rate < CAPTURE_MIN_RATE ||
+        request.rate > CAPTURE_MAX_RATE
+      ) {
+        return `rate must be within ${CAPTURE_MIN_RATE}..${CAPTURE_MAX_RATE}`;
+      }
+      if (
+        !Number.isInteger(request.samples) ||
+        request.samples < 16 ||
+        request.samples > CAPTURE_MAX_SAMPLES
+      ) {
+        return `samples must be within 16..${CAPTURE_MAX_SAMPLES}`;
+      }
+      if ((request.samples / request.rate) * 1000 > CAPTURE_MAX_DURATION_MS) {
+        return `a capture may not span more than ${CAPTURE_MAX_DURATION_MS} ms`;
+      }
+      if (
+        request.pretrigger !== undefined &&
+        !(request.pretrigger >= 0 && request.pretrigger <= 0.9)
+      ) {
+        return 'pretrigger must be within 0..0.9';
+      }
+      const trigger = request.trigger;
+      if (trigger !== undefined) {
+        if (trigger.edge !== 'rising' && trigger.edge !== 'falling') {
+          return 'trigger edge must be "rising" or "falling"';
+        }
+        if (!(trigger.mv >= 0 && trigger.mv <= 3600)) return 'trigger mv must be within 0..3600';
+        if (
+          trigger.timeoutMs !== undefined &&
+          !(trigger.timeoutMs >= 1 && trigger.timeoutMs <= 10_000)
+        ) {
+          return 'trigger timeoutMs must be within 1..10000';
+        }
+      }
+      return null;
     }
     case 'scan.i2c':
       return validPin(request.sda) ?? validPin(request.scl);

@@ -10,8 +10,15 @@ import {
   type BoardDefinition,
   type PinDefinition,
 } from './boards';
-import type { DeviceEvent, DeviceInfo, PinMode } from '../protocol/types';
+import {
+  PREFERRED_BAUD_RATE,
+  type CaptureTrigger,
+  type DeviceEvent,
+  type DeviceInfo,
+  type PinMode,
+} from '../protocol/types';
 import { Emitter, type Transport } from '../transport/types';
+import { decodeSamples } from '../util/base64';
 import { RingBuffer } from '../util/ringBuffer';
 
 export interface LogLine {
@@ -31,6 +38,29 @@ export interface ControllerOptions {
   watchInterval?: number;
   traceCapacity?: number;
   logCapacity?: number;
+  /** Try to renegotiate the link to a faster baud rate after connecting. */
+  upgradeBaud?: boolean;
+}
+
+/** Options for a burst capture. */
+export interface CaptureOptions {
+  rate: number;
+  samples: number;
+  pretrigger?: number;
+  trigger?: CaptureTrigger;
+}
+
+/** An assembled burst capture ready for display or export. */
+export interface AdcCapture {
+  pin: number;
+  /** Actual sampling rate in Hz. */
+  rate: number;
+  /** Host-clock time of the first sample, in milliseconds. */
+  t0: number;
+  /** Raw ADC counts. */
+  samples: Uint16Array;
+  adcMax: number;
+  triggered: boolean;
 }
 
 /**
@@ -48,6 +78,7 @@ export class DiagnosticsController {
   private boardPinnedByUser = false;
   private watchInterval_: number;
   private readonly traceCapacity: number;
+  private readonly upgradeBaud: boolean;
   private status_: SessionStatus = 'closed';
   private unsubscribe: Array<() => void> = [];
   private clockOffset: number | null = null;
@@ -55,6 +86,7 @@ export class DiagnosticsController {
   constructor(options: ControllerOptions = {}) {
     this.watchInterval_ = options.watchInterval ?? 50;
     this.traceCapacity = options.traceCapacity ?? 600;
+    this.upgradeBaud = options.upgradeBaud ?? true;
     this.store_ = new PinStateStore({ capacity: this.traceCapacity });
     this.logs = new RingBuffer<LogLine>(options.logCapacity ?? 500);
   }
@@ -112,7 +144,41 @@ export class DiagnosticsController {
     const info = await session.connect();
     this.applyDeviceInfo(info);
     this.log('info', `Connected: ${info.chip} · ${info.firmware} · protocol v${info.protocol}`);
+    if (this.upgradeBaud) await this.tryUpgradeBaud(session, transport, info);
     return info;
+  }
+
+  /**
+   * Best-effort link upgrade to {@link PREFERRED_BAUD_RATE} for ~8× streaming
+   * throughput. Any failure falls back to the original speed; a failure of the
+   * fallback itself surfaces as a normal disconnect.
+   */
+  private async tryUpgradeBaud(
+    session: DeviceSession,
+    transport: Transport,
+    info: DeviceInfo,
+  ): Promise<void> {
+    if (!transport.setBaudRate || transport.baudRate === undefined) return;
+    const previous = transport.baudRate;
+    if (previous >= PREFERRED_BAUD_RATE) return;
+    if (info.bauds !== undefined && !info.bauds.includes(PREFERRED_BAUD_RATE)) return;
+    try {
+      await session.setBaud(PREFERRED_BAUD_RATE);
+      await transport.setBaudRate(PREFERRED_BAUD_RATE);
+      await session.sysInfo();
+      this.log('info', `Link upgraded to ${PREFERRED_BAUD_RATE} baud`);
+    } catch {
+      this.log('warn', `Could not upgrade the link speed; staying at ${previous} baud`);
+      try {
+        // Ask the device to come back down in case it already switched, then
+        // follow with the host side and verify the link still works.
+        await session.call({ cmd: 'sys.baud', baud: previous }, { timeout: 800 }).catch(() => undefined);
+        await transport.setBaudRate(previous);
+        await session.sysInfo();
+      } catch {
+        // The transport already emitted a close event; nothing more to do.
+      }
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -261,6 +327,91 @@ export class DiagnosticsController {
     if (!this.session_ || this.status_ !== 'connected') return;
     const pins = this.store_.watchedPins();
     await this.session_.watch(pins, this.watchInterval_);
+  }
+
+  /**
+   * Run a burst capture on an ADC pin and assemble the chunked result.
+   *
+   * The command blocks the firmware while it samples, so the watch stream
+   * pauses for the duration; the response timeout accounts for the capture
+   * span plus any trigger wait.
+   */
+  async captureAdc(gpio: number, options: CaptureOptions): Promise<AdcCapture> {
+    const session = this.require();
+    const chunks = new Map<number, Uint16Array>();
+    let expected: number | null = null;
+    let resolveChunks!: () => void;
+    let rejectChunks!: (error: Error) => void;
+    const allChunks = new Promise<void>((resolve, reject) => {
+      resolveChunks = resolve;
+      rejectChunks = reject;
+    });
+    // Chunks can fail before the await below attaches; keep rejections handled.
+    allChunks.catch(() => undefined);
+    const settleIfComplete = () => {
+      if (expected !== null && chunks.size === expected) resolveChunks();
+    };
+    const off = session.onEvent((event) => {
+      if (event.ev !== 'capture' || event.pin !== gpio) return;
+      try {
+        chunks.set(event.seq, decodeSamples(event.data));
+      } catch (error) {
+        rejectChunks(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      expected = event.chunks;
+      settleIfComplete();
+    });
+    try {
+      const captureMs = (options.samples / options.rate) * 1000;
+      const timeout = captureMs + (options.trigger?.timeoutMs ?? 1000) + 4000;
+      const meta = await session.captureAdc(
+        {
+          cmd: 'adc.capture',
+          pin: gpio,
+          rate: options.rate,
+          samples: options.samples,
+          ...(options.pretrigger !== undefined ? { pretrigger: options.pretrigger } : {}),
+          ...(options.trigger !== undefined ? { trigger: options.trigger } : {}),
+        },
+        { timeout },
+      );
+      expected = meta.chunks;
+      settleIfComplete();
+      const chunkTimer = setTimeout(
+        () => rejectChunks(new Error('timed out waiting for capture data')),
+        timeout,
+      );
+      try {
+        await allChunks;
+      } finally {
+        clearTimeout(chunkTimer);
+      }
+      const samples = new Uint16Array(meta.samples);
+      let position = 0;
+      for (let seq = 0; seq < meta.chunks; seq++) {
+        const chunk = chunks.get(seq);
+        if (!chunk) throw new Error(`capture chunk ${seq} missing`);
+        samples.set(chunk.subarray(0, Math.min(chunk.length, samples.length - position)), position);
+        position += chunk.length;
+      }
+      this.log(
+        'info',
+        `Captured ${meta.samples} samples on GPIO${gpio} at ${meta.rate} Hz${
+          meta.triggered ? ' (triggered)' : ''
+        }`,
+      );
+      return {
+        pin: gpio,
+        rate: meta.rate,
+        t0: this.toHostTime(meta.t0),
+        samples,
+        adcMax: this.info?.adcMax ?? 4095,
+        triggered: meta.triggered === true,
+      };
+    } finally {
+      off();
+    }
   }
 
   async scanI2c(sda?: number, scl?: number): Promise<number[]> {

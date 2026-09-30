@@ -13,6 +13,10 @@ export interface Transport {
   onClose(handler: (reason: Error | null) => void): () => void;
   /** Pulse DTR/RTS to reboot the board, when the transport supports it. */
   reset?(): Promise<void>;
+  /** Current link speed, when the transport has one. */
+  readonly baudRate?: number;
+  /** Reconfigure the link speed in place, when the transport supports it. */
+  setBaudRate?(baud: number): Promise<void>;
 }
 
 /** Minimal emitter used by the transports and the device session. */
