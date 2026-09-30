@@ -35,6 +35,8 @@ export class PinTile {
   private readonly canvas: HTMLCanvasElement;
   private readonly watchToggle: HTMLInputElement;
   private renderedMode: PinMode | null = null;
+  /** Cached scope context; `null` once known to be unavailable (e.g. jsdom). */
+  private scopeCtx: CanvasRenderingContext2D | null | undefined;
   /** Live controls of the current mode, kept so `update()` can resync them. */
   private syncControls: (() => void) | null = null;
 
@@ -159,7 +161,7 @@ export class PinTile {
         });
         const toggle = button('Toggle', () => this.run(() => controller.toggle(gpio)));
         const pulse = button('Pulse 250 ms', () =>
-          this.run(() => controller.pulse(gpio, state.output === 1 ? 0 : 1, 250)),
+          this.run(() => controller.pulse(gpio, this.state().output === 1 ? 0 : 1, 250)),
         );
         const blink = el('input', {
           class: 'slider',
@@ -278,7 +280,10 @@ export class PinTile {
   }
 
   private renderScope(state: PinRuntimeState): void {
-    const ctx = prepareCanvas(this.canvas, SPARK_WIDTH, SPARK_HEIGHT);
+    if (this.scopeCtx === undefined) {
+      this.scopeCtx = prepareCanvas(this.canvas, SPARK_WIDTH, SPARK_HEIGHT);
+    }
+    const ctx = this.scopeCtx;
     if (!ctx) return;
     const digital = state.mode !== 'analog' && state.mode !== 'touch';
     drawScope(

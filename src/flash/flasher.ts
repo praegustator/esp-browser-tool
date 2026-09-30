@@ -21,7 +21,11 @@ export interface FlashProgress {
 
 export interface FlashOptions {
   port: SerialPort;
-  parts: FlashPart[];
+  /**
+   * The images to write, or a factory that picks them once the ROM bootloader
+   * has identified the chip — so the board only has to be probed once.
+   */
+  parts: FlashPart[] | ((chip: string) => FlashPart[] | Promise<FlashPart[]>);
   /** Erase the whole flash before writing (wipes stored Wi-Fi credentials). */
   eraseAll?: boolean;
   /** Baud rate used for the flashing session; 921600 is usually safe over USB. */
@@ -42,7 +46,7 @@ export class FlashError extends Error {}
  */
 export async function flashFirmware(options: FlashOptions): Promise<string> {
   const { port, parts } = options;
-  if (parts.length === 0) throw new FlashError('nothing to flash');
+  if (Array.isArray(parts) && parts.length === 0) throw new FlashError('nothing to flash');
   const report = (progress: FlashProgress) => options.onProgress?.(progress);
   const log = (line: string) => options.onLog?.(line);
 
@@ -61,24 +65,26 @@ export async function flashFirmware(options: FlashOptions): Promise<string> {
     },
   });
 
-  const totalBytes = parts.reduce((sum, part) => sum + part.data.length, 0);
-  const writtenBefore: number[] = [];
-  let offsetSum = 0;
-  for (const part of parts) {
-    writtenBefore.push(offsetSum);
-    offsetSum += part.data.length;
-  }
-
   try {
     const chip = await loader.main();
     log(`Detected chip: ${chip}`);
     options.signal?.throwIfAborted();
+
+    const selected = Array.isArray(parts) ? parts : await parts(chip);
+    if (selected.length === 0) throw new FlashError('nothing to flash');
+    const totalBytes = selected.reduce((sum, part) => sum + part.data.length, 0);
+    const writtenBefore: number[] = [];
+    let offsetSum = 0;
+    for (const part of selected) {
+      writtenBefore.push(offsetSum);
+      offsetSum += part.data.length;
+    }
     if (options.eraseAll) {
       report({ phase: 'erasing', fraction: 0, message: 'Erasing flash…', chip });
     }
     report({ phase: 'writing', fraction: 0, message: 'Writing firmware…', chip });
     await loader.writeFlash({
-      fileArray: parts.map((part) => ({ data: part.data, address: part.address })),
+      fileArray: selected.map((part) => ({ data: part.data, address: part.address })),
       flashMode: 'keep',
       flashFreq: 'keep',
       flashSize: 'keep',
@@ -89,7 +95,7 @@ export async function flashFirmware(options: FlashOptions): Promise<string> {
         report({
           phase: 'writing',
           fraction: totalBytes > 0 ? Math.min(1, done / totalBytes) : 0,
-          message: `Writing ${parts[fileIndex]?.name ?? 'firmware'} (${formatBytes(done)} / ${formatBytes(totalBytes)})`,
+          message: `Writing ${selected[fileIndex]?.name ?? 'firmware'} (${formatBytes(done)} / ${formatBytes(totalBytes)})`,
           chip,
         });
       },

@@ -118,8 +118,8 @@ export class FlashPanel {
 
   /**
    * Shared flashing flow. The parts factory receives the detected chip so the
-   * manifest build can be chosen after the board identifies itself, which is
-   * why the port is probed twice (once to detect, once to write).
+   * manifest build can be chosen after the board identifies itself, without
+   * probing the ROM bootloader a second time.
    */
   private async flash(parts: (chip: string) => Promise<FlashPart[]>): Promise<void> {
     if (this.busy) return;
@@ -132,19 +132,19 @@ export class FlashPanel {
       if (this.controller.connected) await this.controller.disconnect();
       const port = await requestSerialPort();
       this.setProgress(0, 'Detecting chip…');
-      // Detect first with a throw-away loader run so the right build is chosen.
-      const chip = await detectChip(port, (line) => this.controller.log('info', line));
-      this.controller.log('info', `Chip detected: ${chip}`);
-      const selected = await parts(chip);
-      this.controller.log(
-        'info',
-        `Flashing ${selected.length} part(s), ${formatBytes(
-          selected.reduce((sum, part) => sum + part.data.length, 0),
-        )} total`,
-      );
       await flashFirmware({
         port,
-        parts: selected,
+        parts: async (chip) => {
+          this.controller.log('info', `Chip detected: ${chip}`);
+          const selected = await parts(chip);
+          this.controller.log(
+            'info',
+            `Flashing ${selected.length} part(s), ${formatBytes(
+              selected.reduce((sum, part) => sum + part.data.length, 0),
+            )} total`,
+          );
+          return selected;
+        },
         eraseAll: this.eraseToggle.checked,
         onProgress: (progress) => this.setProgress(progress.fraction, progress.message),
         onLog: (line) => this.controller.log('info', line),
@@ -157,28 +157,6 @@ export class FlashPanel {
     } finally {
       this.busy = false;
     }
-  }
-}
-
-/** Run the ROM bootloader handshake only, to learn which chip is attached. */
-async function detectChip(port: SerialPort, log: (line: string) => void): Promise<string> {
-  const { ESPLoader, Transport } = await import('esptool-js');
-  const transport = new Transport(port, false);
-  const loader = new ESPLoader({
-    transport,
-    baudrate: 115200,
-    romBaudrate: 115200,
-    terminal: {
-      clean: () => undefined,
-      write: (data: string) => log(data.replace(/\r/g, '')),
-      writeLine: (data: string) => log(data.replace(/\r/g, '')),
-    },
-  });
-  try {
-    return await loader.main();
-  } finally {
-    await transport.disconnect().catch(() => undefined);
-    await transport.waitForUnlock(1500).catch(() => undefined);
   }
 }
 

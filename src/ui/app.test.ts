@@ -95,18 +95,14 @@ describe('App shell', () => {
     expect(app.controller.store.watchedPins()).toContain(4);
   });
 
-  it('surfaces device errors in the console panel', async () => {
+  it('rejects writes to an input pin with the device error', async () => {
     const app = await mountedDemoApp();
     const tile = tileOf(app, 4);
     setMode(tile, 'input');
     await waitFor(() => app.controller.store.get(4).mode === 'input');
-    // Writing to an input must fail and be reported rather than thrown.
-    await app.controller.setLevel(4, 1).catch(() => undefined);
-    await waitFor(() =>
-      app.controller.logs.toArray().some((line) => line.text.includes('not configured as an output')),
-    ).catch(() => undefined);
-    const logText = app.root.querySelector('.log-list')?.textContent ?? '';
-    expect(logText).toContain('Connected');
+    // Writing to an input must be refused by the board rather than silently applied.
+    await expect(app.controller.setLevel(4, 1)).rejects.toThrow('not configured as an output');
+    expect(app.controller.store.get(4).last?.d).toBeUndefined();
   });
 
   it('blinks the onboard LED through the toolbar action', async () => {

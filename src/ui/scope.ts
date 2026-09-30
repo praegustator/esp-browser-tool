@@ -125,10 +125,16 @@ export function prepareCanvas(
   height: number,
 ): CanvasRenderingContext2D | null {
   const ratio = typeof devicePixelRatio === 'number' ? devicePixelRatio : 1;
-  canvas.width = Math.max(1, Math.round(width * ratio));
-  canvas.height = Math.max(1, Math.round(height * ratio));
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
+  const pixelWidth = Math.max(1, Math.round(width * ratio));
+  const pixelHeight = Math.max(1, Math.round(height * ratio));
+  // Assigning width/height reallocates and clears the backing store, so only do
+  // it when the size actually changed — this runs on every sample batch.
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+  }
   let ctx: CanvasRenderingContext2D | null = null;
   try {
     ctx = canvas.getContext('2d');
