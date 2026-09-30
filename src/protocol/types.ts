@@ -257,6 +257,13 @@ export type DeviceEvent = ReadyEvent | SampleEvent | LogEvent | PinEvent | Error
 
 export type DeviceMessage = Response | DeviceEvent;
 
+/**
+ * A request without its correlation id. Written as a distributive conditional
+ * so each member of the {@link Request} union keeps its own payload fields
+ * (a plain `Omit<Request, 'id'>` would collapse them into an unusable type).
+ */
+export type RequestBody<T = Request> = T extends { id: number } ? Omit<T, 'id'> : never;
+
 /** Protocol revision implemented by this build. */
 export const PROTOCOL_VERSION = 1;
 

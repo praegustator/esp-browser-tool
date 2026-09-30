@@ -318,7 +318,7 @@ export class SimulatedBoard implements Transport {
         return;
       }
       default:
-        this.respondError(request.id, 'unknown_command', `unsupported command`);
+        this.respondError((request as Request).id, 'unknown_command', 'unsupported command');
     }
   }
 

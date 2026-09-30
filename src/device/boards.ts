@@ -5,6 +5,8 @@
  * a boot, and to pre-select sensible defaults.
  */
 
+import { chipFamilyOf } from '../util/chipFamily';
+
 export type PinCapability = 'digital' | 'input-only' | 'adc' | 'dac' | 'touch' | 'i2c' | 'spi' | 'uart';
 
 export interface PinDefinition {
@@ -178,15 +180,28 @@ export const BOARDS: BoardDefinition[] = [
 
 export const DEFAULT_BOARD = BOARDS[0]!;
 
-/** Best effort mapping from a chip description to a known board layout. */
+/**
+ * Best effort mapping from a chip description to a known board layout.
+ *
+ * Matching goes through {@link chipFamilyOf} so that a chip we do not have a
+ * layout for (say ESP32-C6) is not mistaken for a plain ESP32 just because its
+ * name contains that string; such chips fall back to the default layout, and
+ * the UI tells the user to pick a board manually.
+ */
 export function boardForChip(chip: string | undefined): BoardDefinition {
   if (!chip) return DEFAULT_BOARD;
-  const needle = chip.toUpperCase();
-  // Longest match first so "ESP32-S3" never falls back to plain "ESP32".
-  const candidates = BOARDS.flatMap((board) =>
-    board.chipMatches.map((match) => ({ board, match: match.toUpperCase() })),
-  ).sort((a, b) => b.match.length - a.match.length);
-  return candidates.find(({ match }) => needle.includes(match))?.board ?? DEFAULT_BOARD;
+  const family = chipFamilyOf(chip);
+  return (
+    BOARDS.find((board) => board.chipMatches.some((match) => chipFamilyOf(match) === family)) ??
+    DEFAULT_BOARD
+  );
+}
+
+/** True when the layout returned by {@link boardForChip} is only a guess. */
+export function isExactBoardMatch(chip: string | undefined): boolean {
+  if (!chip) return false;
+  const family = chipFamilyOf(chip);
+  return BOARDS.some((board) => board.chipMatches.some((match) => chipFamilyOf(match) === family));
 }
 
 export function boardById(id: string): BoardDefinition | undefined {

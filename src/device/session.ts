@@ -6,6 +6,7 @@ import {
   type PinMode,
   type PinSample,
   type Request,
+  type RequestBody,
   type Response,
 } from '../protocol/types';
 import { Emitter, type Transport } from '../transport/types';
@@ -138,7 +139,7 @@ export class DeviceSession {
   }
 
   /** Send a command and await its response. */
-  call<T = unknown>(request: Omit<Request, 'id'>): Promise<T> {
+  call<T = unknown>(request: RequestBody): Promise<T> {
     const id = this.nextId++;
     const full = { ...request, id } as Request;
     return new Promise<T>((resolve, reject) => {
