@@ -1,0 +1,35 @@
+{
+  "name": "esp-browser-tool",
+  "version": "1.0.0",
+  "description": "Browser based live diagnostic tool for ESP32 boards: flash the diagnostic firmware over Web Serial, then watch, drive and scope every GPIO from Chrome.",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/praegustator/esp-browser-tool.git"
+  },
+  "keywords": [
+    "esp32",
+    "web-serial",
+    "diagnostics",
+    "gpio"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/w3c-web-serial": "^1.0.8",
+    "jsdom": "^30.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "esptool-js": "^0.7.0"
+  },
+  "type": "module"
+}
